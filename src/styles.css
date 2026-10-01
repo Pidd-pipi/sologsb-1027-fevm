@@ -170,11 +170,54 @@ button, input, textarea, select { font: inherit; }
   .banner-progress { grid-column: auto; }
   .workspace-tabs { margin: 12px; overflow-x: auto; }
   .workspace-tabs .bp6-tab { min-width: 135px; }
-  .editor-layout, .review-layout, .compare-layout { padding: 12px; grid-template-columns: 1fr; }
+  .editor-layout, .review-layout, .compare-layout, .schedule-layout { padding: 12px; grid-template-columns: 1fr; }
   .inspector-panel, .review-actions, .freeze-rules { grid-column: auto; grid-template-columns: 1fr; position: static; }
   .meta-grid, .form-grid, .form-grid.two-column, .dependency-grid, .review-facts { grid-template-columns: 1fr; }
   .comment-compose { grid-template-columns: 1fr; }
   .diff-selects { flex-wrap: wrap; justify-content: flex-end; }
   .diff-row, .diff-head { grid-template-columns: 60px 1fr; }
   .diff-row p, .diff-head span:last-child { grid-column: 1 / 3; margin-top: 5px; }
+}
+
+/* ===== 排程 ===== */
+.schedule-conflict { margin: 14px 22px 0; }
+.schedule-conflict .conflict-list { margin: 8px 0 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.schedule-conflict .conflict-list li { padding: 9px 11px; border: 1px solid #f0c4c4; border-radius: 7px; background: #fff7f7; }
+.schedule-conflict .conflict-list li > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.schedule-conflict .conflict-list strong { font-size: 11px; }
+.schedule-conflict .conflict-list p { margin: 5px 0 0; color: #7a5252; font-size: 10px; line-height: 1.6; }
+.schedule-layout { padding: 16px 22px 34px; display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 14px; align-items: start; }
+.schedule-main { min-width: 0; display: grid; gap: 14px; }
+.schedule-side { display: grid; gap: 14px; position: sticky; top: 85px; }
+.schedule-table-card, .instrument-card, .schedule-stats-card { padding: 19px; border: 1px solid var(--line); border-radius: 10px; }
+.schedule-table-wrap { margin-top: 12px; overflow-x: auto; border: 1px solid #dce2e9; border-radius: 8px; }
+.schedule-table { width: 100%; min-width: 920px; border-collapse: collapse; font-size: 10px; }
+.schedule-table th { padding: 9px 10px; color: #697687; background: #f1f4f7; font-weight: 600; text-align: left; white-space: nowrap; }
+.schedule-table td { padding: 8px 10px; border-top: 1px solid #e6ebf0; vertical-align: middle; }
+.schedule-table tr.unscheduled { background: #fffdf4; }
+.schedule-table .step-cell { display: flex; align-items: center; gap: 8px; min-width: 180px; }
+.schedule-table .step-index { color: #738092; font: 600 10px "IBM Plex Mono", monospace; }
+.schedule-table .step-title-text { font-weight: 600; }
+.schedule-table .bp6-html-select { min-width: 130px; }
+.schedule-table .bp6-input, .schedule-table input[type="datetime-local"] { height: 28px; font-size: 10px; }
+.schedule-table .time-cell { white-space: nowrap; font: 500 10px "IBM Plex Mono", monospace; }
+.schedule-table .wait-cell { white-space: nowrap; color: var(--amber); font-weight: 600; }
+.gantt-track { position: relative; width: 100%; min-width: 160px; height: 16px; border-radius: 4px; background: #eef2f6; }
+.gantt-bar { position: absolute; top: 2px; bottom: 2px; border-radius: 3px; opacity: .85; }
+.instrument-list { display: grid; gap: 9px; margin-bottom: 12px; }
+.instrument-row { display: grid; grid-template-columns: 1fr 70px 1.4fr 30px; gap: 7px; align-items: center; }
+.instrument-row .inst-count input { text-align: center; }
+.instrument-row .inst-time { display: flex; align-items: center; gap: 5px; }
+.instrument-row .inst-time span { color: #7b8797; font-size: 9px; }
+.instrument-row input[type="time"] { height: 28px; font-size: 10px; }
+.schedule-summary { margin-top: 14px; padding: 12px 13px; border: 1px solid #dfe6ee; border-radius: 8px; background: #f8fafb; }
+.schedule-summary-head { display: flex; align-items: center; gap: 7px; color: var(--blue); font: 600 10px "IBM Plex Mono", monospace; letter-spacing: .08em; }
+.schedule-summary-head .bp6-tag { margin-left: auto; }
+.schedule-summary-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+.schedule-summary-grid span, .schedule-summary-grid strong { display: block; }
+.schedule-summary-grid span { color: #758192; font-size: 9px; }
+.schedule-summary-grid strong { margin-top: 3px; font-size: 10px; }
+@media (max-width: 1240px) {
+  .schedule-layout { grid-template-columns: 1fr; }
+  .schedule-side { position: static; }
 }

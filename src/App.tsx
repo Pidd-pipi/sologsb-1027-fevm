@@ -16,10 +16,21 @@ import {
   Tag,
   TextArea
 } from '@blueprintjs/core';
+import {
+  defaultInstruments,
+  formatScheduleTime,
+  scheduleProcess,
+  toLocalInputValue,
+  uidInstrument,
+  type Instrument,
+  type ScheduleConflict,
+  type ScheduleOutcome
+} from './schedule';
 
 type StepStatus = 'draft' | 'submitted' | 'confirmed' | 'returned';
 type ProcessStatus = 'draft' | 'in-review' | 'frozen' | 'revising';
-type ViewId = 'editor' | 'review' | 'compare';
+type ViewId = 'editor' | 'schedule' | 'review' | 'compare';
+type ScheduleField = 'duration' | 'dependencies' | 'instrumentId' | 'earliestStart';
 
 interface ReviewComment {
   id: string;
@@ -45,6 +56,14 @@ interface ProcessStep {
   expectedResult: string;
   status: StepStatus;
   comments: ReviewComment[];
+  // 排程字段
+  instrumentId?: string;
+  instrumentName?: string;   // 冗余仪器名，随版本快照保存
+  earliestStart?: string;    // 不可早于时间（ISO）
+  scheduledStart?: string;  // 计算开始时间（ISO）
+  scheduledEnd?: string;    // 计算结束时间（ISO）
+  waitMinutes?: number;      // 等待时长（分钟）
+  scheduleStatus?: 'scheduled' | 'unscheduled';
 }
 
 interface VersionSnapshot {
@@ -67,6 +86,7 @@ interface ExperimentProcess {
   status: ProcessStatus;
   version: string;
   steps: ProcessStep[];
+  instruments: Instrument[];
   versions: VersionSnapshot[];
   frozenAt?: string;
   updatedAt: string;
@@ -144,6 +164,9 @@ function initialProcess(): ExperimentProcess {
     }
   ];
 
+  // 种子数据未选择仪器，统一标记为未排程。
+  baseSteps.forEach((step) => { step.scheduleStatus = 'unscheduled'; });
+
   const firstVersion: VersionSnapshot = {
     id: 'version-1-0', label: '首版批准流程', version: '1.0.0', createdAt: '2026-09-20T14:30:00+08:00',
     note: '建立基础反应与取样步骤。', author: '王颖',
@@ -160,12 +183,14 @@ function initialProcess(): ExperimentProcess {
     objective: '在受控温度下评价催化剂活性，并完整记录过程样品与安全控制措施。',
     principal: '李明', lab: '材料化学实验室 B-207',
     status: 'in-review', version: '1.2.0-draft',
-    steps: baseSteps, versions: [firstVersion, secondVersion], updatedAt: new Date().toISOString()
+    steps: baseSteps, instruments: defaultInstruments(), versions: [firstVersion, secondVersion],
+    updatedAt: new Date().toISOString()
   };
 }
 
 function historyReducer(state: HistoryState, action:
   | { type: 'commit'; update: (draft: ExperimentProcess) => void }
+  | { type: 'commit-value'; value: ExperimentProcess }
   | { type: 'undo' }
   | { type: 'redo' }
   | { type: 'reset'; value: ExperimentProcess }
@@ -173,6 +198,11 @@ function historyReducer(state: HistoryState, action:
   if (action.type === 'commit') {
     const next = clone(state.present);
     action.update(next);
+    next.updatedAt = new Date().toISOString();
+    return { past: [...state.past.slice(-59), clone(state.present)], present: next, future: [] };
+  }
+  if (action.type === 'commit-value') {
+    const next = clone(action.value);
     next.updatedAt = new Date().toISOString();
     return { past: [...state.past.slice(-59), clone(state.present)], present: next, future: [] };
   }
@@ -193,11 +223,42 @@ function loadProcess(): ExperimentProcess {
   try {
     const value = localStorage.getItem(STORAGE_KEY);
     if (!value) return initialProcess();
-    const parsed = JSON.parse(value) as ExperimentProcess;
-    return parsed.id && Array.isArray(parsed.steps) ? parsed : initialProcess();
+    const parsed = JSON.parse(value) as Partial<ExperimentProcess>;
+    if (!parsed.id || !Array.isArray(parsed.steps)) return initialProcess();
+    return migrateProcess(parsed);
   } catch {
     return initialProcess();
   }
+}
+
+// 旧数据升级：补齐仪器台账，并将缺少排程字段的步骤标记为未排程。
+function migrateProcess(parsed: Partial<ExperimentProcess>): ExperimentProcess {
+  const process = parsed as ExperimentProcess;
+  if (!Array.isArray(process.instruments) || process.instruments.length === 0) {
+    process.instruments = defaultInstruments();
+  }
+  process.instruments = process.instruments.map((inst) => ({
+    id: inst.id || uidInstrument(),
+    name: inst.name || '未命名仪器',
+    count: typeof inst.count === 'number' && inst.count >= 1 ? Math.round(inst.count) : 1,
+    workStart: /^\d{1,2}:\d{2}$/.test(inst.workStart) ? inst.workStart : '09:00',
+    workEnd: /^\d{1,2}:\d{2}$/.test(inst.workEnd) ? inst.workEnd : '17:00'
+  }));
+  for (const step of process.steps) {
+    if (step.scheduleStatus !== 'scheduled' && step.scheduleStatus !== 'unscheduled') {
+      step.scheduleStatus = step.scheduledStart && step.instrumentId ? 'scheduled' : 'unscheduled';
+    }
+    if (step.scheduleStatus === 'unscheduled') {
+      step.scheduledStart = undefined;
+      step.scheduledEnd = undefined;
+      step.waitMinutes = undefined;
+      step.instrumentName = undefined;
+    } else if (step.instrumentId) {
+      const inst = process.instruments.find((item) => item.id === step.instrumentId);
+      if (inst) step.instrumentName = inst.name;
+    }
+  }
+  return process;
 }
 
 function splitList(value: string): string[] {
@@ -230,6 +291,7 @@ function App() {
   const [online, setOnline] = useState(true);
   const [compareBaseId, setCompareBaseId] = useState(process.versions[0]?.id ?? '');
   const [compareTargetId, setCompareTargetId] = useState(process.versions.at(-1)?.id ?? '');
+  const [scheduleError, setScheduleError] = useState<{ kind: 'conflict' | 'cycle'; conflicts: ScheduleConflict[] } | null>(null);
   const initialSaveSkipped = useRef(false);
 
   const selectedStep = process.steps.find((step) => step.id === selectedStepId) ?? process.steps[0];
@@ -238,6 +300,8 @@ function App() {
   const missingSafetySteps = process.steps.filter(hasMissingSafety);
   const pendingReviewCount = process.steps.filter((step) => step.status === 'submitted' || step.status === 'returned').length;
   const confirmedCount = process.steps.filter((step) => step.status === 'confirmed').length;
+  const scheduledCount = process.steps.filter((step) => step.scheduleStatus === 'scheduled').length;
+  const allScheduled = process.steps.length > 0 && scheduledCount === process.steps.length;
   const reviewProgress = process.steps.length ? Math.round((confirmedCount / process.steps.length) * 100) : 0;
   const versionDiff = useMemo(() => compareVersions(process, compareBaseId, compareTargetId), [process, compareBaseId, compareTargetId]);
 
@@ -285,6 +349,90 @@ function App() {
     dispatch({ type: 'commit', update });
   };
 
+  // 将排程试算结果写回草稿：成功时写入开始/结束/等待时长，失败时标记未排程。
+  const applyScheduleToDraft = (draft: ExperimentProcess, outcome: ScheduleOutcome): void => {
+    for (const step of draft.steps) {
+      const scheduled = outcome.schedules.get(step.id);
+      if (scheduled) {
+        step.scheduleStatus = 'scheduled';
+        step.instrumentId = scheduled.instrumentId;
+        step.instrumentName = scheduled.instrumentName;
+        step.scheduledStart = scheduled.start;
+        step.scheduledEnd = scheduled.end;
+        step.waitMinutes = scheduled.waitMinutes;
+      } else {
+        step.scheduleStatus = 'unscheduled';
+        step.scheduledStart = undefined;
+        step.scheduledEnd = undefined;
+        step.waitMinutes = undefined;
+        step.instrumentName = undefined;
+      }
+    }
+  };
+
+  // 对容量敏感的改写：先在草稿上试算排程，成功才提交；容量不足或循环依赖时整体回滚，保留改动前的有效排程。
+  const trySchedule = (update: (draft: ExperimentProcess) => void): void => {
+    const draft = clone(process);
+    update(draft);
+    const outcome = scheduleProcess(draft.steps, draft.instruments);
+    if (outcome.cycle) {
+      setScheduleError({ kind: 'cycle', conflicts: [] });
+      return;
+    }
+    if (outcome.conflicts.length) {
+      setScheduleError({ kind: 'conflict', conflicts: outcome.conflicts });
+      return;
+    }
+    applyScheduleToDraft(draft, outcome);
+    setScheduleError(null);
+    dispatch({ type: 'commit-value', value: draft });
+  };
+
+  // 结构或非容量敏感改写：提交并重算排程（新增/删除步骤不会导致容量冲突）。
+  const commitAndSchedule = (update: (draft: ExperimentProcess) => void): void => {
+    const draft = clone(process);
+    update(draft);
+    const outcome = scheduleProcess(draft.steps, draft.instruments);
+    applyScheduleToDraft(draft, outcome);
+    setScheduleError(null);
+    dispatch({ type: 'commit-value', value: draft });
+  };
+
+  const SCHEDULE_FIELDS: ReadonlySet<ScheduleField> = new Set<ScheduleField>(['duration', 'dependencies', 'instrumentId', 'earliestStart']);
+
+  const updateInstrument = (id: string, field: keyof Instrument, value: string | number): void => {
+    trySchedule((draft) => {
+      const inst = draft.instruments.find((item) => item.id === id);
+      if (!inst) return;
+      if (field === 'count') {
+        inst.count = Math.max(1, Math.round(Number(value) || 1));
+      } else if (field === 'name') {
+        inst.name = String(value);
+      } else if (field === 'workStart' || field === 'workEnd') {
+        const next = String(value);
+        if (/^\d{1,2}:\d{2}$/.test(next)) inst[field] = next;
+      }
+    });
+  };
+
+  const addInstrument = (): void => {
+    commitAndSchedule((draft) => {
+      draft.instruments.push({ id: uidInstrument(), name: '新仪器', count: 1, workStart: '09:00', workEnd: '17:00' });
+    });
+  };
+
+  const removeInstrument = (id: string): void => {
+    commitAndSchedule((draft) => {
+      draft.instruments = draft.instruments.filter((inst) => inst.id !== id);
+      draft.steps.forEach((step) => {
+        if (step.instrumentId === id) {
+          step.instrumentId = undefined;
+          step.instrumentName = undefined;
+        }
+      });
+    });
+  };
+
   const updateProcessField = (field: 'title' | 'code' | 'objective' | 'principal' | 'lab', value: string): void => {
     commitProcess((draft) => { draft[field] = value; });
   };
@@ -293,6 +441,14 @@ function App() {
     if (!selectedStep) return;
     const id = selectedStep.id;
     setLastModifiedId(id);
+    if (SCHEDULE_FIELDS.has(field as ScheduleField)) {
+      // 时长、依赖、仪器、不可早于时间的变化会立即触发排程重算；容量不足时整体回滚。
+      trySchedule((draft) => {
+        const step = draft.steps.find((item) => item.id === id);
+        if (step) (step as unknown as Record<string, unknown>)[field] = value;
+      });
+      return;
+    }
     commitProcess((draft) => {
       const step = draft.steps.find((item) => item.id === id);
       if (step) (step as unknown as Record<string, unknown>)[field] = value;
@@ -306,11 +462,11 @@ function App() {
   const addStep = (): void => {
     if (process.status === 'frozen') return;
     const id = uid('step');
-    commitProcess((draft) => {
+    commitAndSchedule((draft) => {
       draft.steps.push({
         id, title: '新的实验步骤', purpose: '', materials: '', equipment: '', amount: '', duration: 10,
         hazards: [], controls: '', dependencies: draft.steps.at(-1) ? [draft.steps.at(-1)!.id] : [],
-        safetyNote: '', expectedResult: '', status: 'draft', comments: []
+        safetyNote: '', expectedResult: '', status: 'draft', comments: [], scheduleStatus: 'unscheduled'
       });
       draft.status = 'draft';
     });
@@ -327,7 +483,15 @@ function App() {
     copy.status = 'draft';
     copy.comments = [];
     copy.dependencies = [...copy.dependencies];
-    commitProcess((draft) => {
+    // 副本不继承仪器与排程结果，需重新选择仪器后排程。
+    copy.instrumentId = undefined;
+    copy.instrumentName = undefined;
+    copy.earliestStart = undefined;
+    copy.scheduledStart = undefined;
+    copy.scheduledEnd = undefined;
+    copy.waitMinutes = undefined;
+    copy.scheduleStatus = 'unscheduled';
+    commitAndSchedule((draft) => {
       const index = draft.steps.findIndex((step) => step.id === selectedStep.id);
       draft.steps.splice(index + 1, 0, copy);
     });
@@ -337,7 +501,7 @@ function App() {
   const deleteStep = (): void => {
     if (!selectedStep || process.steps.length <= 1 || process.status === 'frozen') return;
     const id = selectedStep.id;
-    commitProcess((draft) => {
+    commitAndSchedule((draft) => {
       draft.steps = draft.steps.filter((step) => step.id !== id);
       draft.steps.forEach((step) => { step.dependencies = step.dependencies.filter((dependency) => dependency !== id); });
     });
@@ -347,7 +511,7 @@ function App() {
   const moveStep = (direction: -1 | 1): void => {
     if (!selectedStep || process.status === 'frozen') return;
     const id = selectedStep.id;
-    commitProcess((draft) => {
+    commitAndSchedule((draft) => {
       const index = draft.steps.findIndex((step) => step.id === id);
       const nextIndex = index + direction;
       if (nextIndex < 0 || nextIndex >= draft.steps.length) return;
@@ -411,13 +575,17 @@ function App() {
       setSavedLabel('冻结条件未满足');
       return;
     }
+    if (!allScheduled) {
+      setSavedLabel('存在未排程步骤，无法冻结');
+      return;
+    }
     const nextNumber = nextMinorVersion(process.version);
     const previousVersionId = process.versions.at(-1)?.id ?? '';
     const frozenVersionId = uid('version');
     commitProcess((draft) => {
       draft.versions.push({
         id: frozenVersionId, label: '复核通过冻结版', version: nextNumber,
-        createdAt: new Date().toISOString(), note: `${draft.steps.length} 个步骤全部确认，安全控制完整。`,
+        createdAt: new Date().toISOString(), note: `${draft.steps.length} 个步骤全部确认，安全控制完整，排程有效。`,
         author: CURRENT_AUTHOR, steps: clone(draft.steps)
       });
       draft.version = nextNumber;
@@ -446,10 +614,14 @@ function App() {
   };
 
   const addVersionSnapshot = (): void => {
+    if (!allScheduled) {
+      setSavedLabel('存在未排程步骤，不能保存快照');
+      return;
+    }
     commitProcess((draft) => {
       draft.versions.push({
         id: uid('version'), label: '工作版本快照', version: draft.version.replace('-draft', ''),
-        createdAt: new Date().toISOString(), note: '保存当前步骤与复核状态。',
+        createdAt: new Date().toISOString(), note: '保存当前步骤、排程与复核状态。',
         author: CURRENT_AUTHOR, steps: clone(draft.steps)
       });
     });
@@ -492,15 +664,39 @@ function App() {
         <div className="banner-progress">
           <div><span>复核进度</span><strong>{confirmedCount}/{process.steps.length}</strong></div>
           <ProgressBar value={reviewProgress / 100} intent={reviewProgress === 100 ? 'success' : 'primary'} stripes={reviewProgress < 100} />
-          <small>{pendingReviewCount ? `${pendingReviewCount} 条待处理` : '所有步骤已处理'} · {missingSafetySteps.length} 条安全缺口</small>
+          <small>{pendingReviewCount ? `${pendingReviewCount} 条待处理` : '所有步骤已处理'} · {missingSafetySteps.length} 条安全缺口 · {allScheduled ? '排程完整' : `${process.steps.length - scheduledCount} 步未排程`}</small>
         </div>
       </section>
 
       <Tabs id="workspace-tabs" selectedTabId={activeView} onChange={(value) => setActiveView(value as ViewId)} renderActiveTabPanelOnly className="workspace-tabs">
         <Tab id="editor" title={<span><Icon icon="edit" /> 流程编写</span>} />
+        <Tab id="schedule" title={<span><Icon icon="calendar" /> 排程 {!allScheduled && <b className="tab-badge">{process.steps.length - scheduledCount}</b>}</span>} />
         <Tab id="review" title={<span><Icon icon="endorsed" /> 安全复核 {pendingReviewCount > 0 && <b className="tab-badge">{pendingReviewCount}</b>}</span>} />
         <Tab id="compare" title={<span><Icon icon="comparison" /> 版本比较</span>} />
       </Tabs>
+
+      {scheduleError && (
+        <Callout className="schedule-conflict" intent="danger" icon="warning-sign">
+          {scheduleError.kind === 'cycle' ? (
+            <>
+              <strong>依赖关系存在循环，无法排程。</strong>
+              <p>本次修改已拒绝并保留改动前的有效排程，请检查前置步骤设置，消除循环依赖。</p>
+            </>
+          ) : (
+            <>
+              <strong>排程失败：{scheduleError.conflicts.length} 个步骤无法在当天窗口内完成，已保留改动前的有效排程。</strong>
+              <ul className="conflict-list">
+                {scheduleError.conflicts.map((conflict) => (
+                  <li key={conflict.stepId}>
+                    <div><strong>{conflict.stepTitle}</strong><Tag minimal intent="danger">缺口 {conflict.shortageMinutes} 分钟</Tag></div>
+                    <p>{conflict.message}</p>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </Callout>
+      )}
 
       {activeView === 'editor' && selectedStep && (
         <main className="editor-layout">
@@ -513,7 +709,7 @@ function App() {
               {process.steps.map((step, index) => (
                 <button key={step.id} className={step.id === selectedStep.id ? 'selected' : ''} onClick={() => setSelectedStepId(step.id)}>
                   <span className={`step-number ${step.status}`}>{String(index + 1).padStart(2, '0')}</span>
-                  <span className="step-copy"><strong>{step.title}</strong><small>{step.duration} 分钟 · {statusLabel(step.status)}</small></span>
+                  <span className="step-copy"><strong>{step.title}</strong><small>{step.duration} 分钟 · {statusLabel(step.status)} · {step.scheduleStatus === 'scheduled' ? '已排程' : '未排程'}</small></span>
                   {hasMissingSafety(step) && <Icon icon="warning-sign" intent="danger" size={13} />}
                 </button>
               ))}
@@ -559,6 +755,16 @@ function App() {
                 <TextArea id="safety-note" fill intent={hasMissingSafety(selectedStep) ? 'danger' : 'none'} value={selectedStep.safetyNote} onChange={(event) => updateStep('safetyNote', event.target.value)} />
               </FormGroup>
               <FormGroup label="预期结果" labelFor="expected"><TextArea id="expected" fill value={selectedStep.expectedResult} onChange={(event) => updateStep('expectedResult', event.target.value)} /></FormGroup>
+              <div className="schedule-summary">
+                <div className="schedule-summary-head"><Icon icon="calendar" size={13} /><span>排程结果</span>{selectedStep.scheduleStatus === 'scheduled' ? <Tag minimal intent="success">已排程</Tag> : <Tag minimal intent="warning">未排程</Tag>}</div>
+                <div className="schedule-summary-grid">
+                  <div><span>仪器</span><strong>{selectedStep.instrumentName ?? '未选择'}</strong></div>
+                  <div><span>不可早于</span><strong>{formatScheduleTime(selectedStep.earliestStart)}</strong></div>
+                  <div><span>开始</span><strong>{formatScheduleTime(selectedStep.scheduledStart)}</strong></div>
+                  <div><span>结束</span><strong>{formatScheduleTime(selectedStep.scheduledEnd)}</strong></div>
+                  <div><span>等待时长</span><strong>{selectedStep.waitMinutes != null ? `${selectedStep.waitMinutes} 分钟` : '—'}</strong></div>
+                </div>
+              </div>
             </Card>
 
             <Card elevation={Elevation.ONE} className="dependency-card">
@@ -605,9 +811,89 @@ function App() {
               <div className="card-title"><div><span>RELEASE GATE</span><h3>提交与冻结</h3></div></div>
               <div className="gate-row"><span>复核状态</span><strong>{confirmedCount}/{process.steps.length}</strong></div>
               <div className="gate-row"><span>安全缺口</span><strong className={missingSafetySteps.length ? 'danger-text' : ''}>{missingSafetySteps.length}</strong></div>
+              <div className="gate-row"><span>排程状态</span><strong className={allScheduled ? '' : 'danger-text'}>{allScheduled ? `${scheduledCount} 步已排程` : `${process.steps.length - scheduledCount} 步未排程`}</strong></div>
               <div className="gate-row"><span>流程状态</span><strong>{processStatusLabel(process.status)}</strong></div>
               <Divider />
               {process.status === 'frozen' ? <Button fill intent="warning" icon="git-branch" text="从冻结版创建修订" onClick={startRevision} /> : <Button fill intent="primary" icon="send-to" text="提交复核" onClick={submitForReview} />}
+            </Card>
+          </aside>
+        </main>
+      )}
+
+      {activeView === 'schedule' && (
+        <main className="schedule-layout">
+          <section className="schedule-main">
+            <Card elevation={Elevation.ONE} className="schedule-table-card">
+              <div className="card-title">
+                <div><span>SCHEDULE</span><h3>步骤排程表</h3></div>
+                <Tag minimal intent={allScheduled ? 'success' : 'warning'}>{scheduledCount}/{process.steps.length} 已排程</Tag>
+              </div>
+              <p className="muted">为每一步选择仪器并设置不可早于时间，系统按依赖关系与仪器可用台数自动计算开始、结束与等待时长。同一仪器并行占用不超过可用台数。</p>
+              <div className="schedule-table-wrap">
+                <table className="schedule-table">
+                  <thead>
+                    <tr><th>步骤</th><th>仪器</th><th>不可早于</th><th>开始</th><th>结束</th><th>等待</th><th>状态</th><th>排程条（08:00–18:00）</th></tr>
+                  </thead>
+                  <tbody>
+                    {process.steps.map((step, index) => (
+                      <tr key={step.id} className={step.scheduleStatus === 'unscheduled' ? 'unscheduled' : ''}>
+                        <td className="step-cell"><span className="step-index">{String(index + 1).padStart(2, '0')}</span><span className="step-title-text">{step.title}</span></td>
+                        <td>
+                          <HTMLSelect
+                            value={step.instrumentId ?? ''}
+                            onChange={(event) => updateStep('instrumentId', event.target.value || undefined)}
+                          >
+                            <option value="">未排程</option>
+                            {process.instruments.map((inst) => <option key={inst.id} value={inst.id}>{inst.name}（{inst.count} 台）</option>)}
+                          </HTMLSelect>
+                        </td>
+                        <td>
+                          <input
+                            type="datetime-local"
+                            className="bp6-input"
+                            value={toLocalInputValue(step.earliestStart)}
+                            onChange={(event) => updateStep('earliestStart', event.target.value ? new Date(event.target.value).toISOString() : undefined)}
+                          />
+                        </td>
+                        <td className="time-cell">{formatScheduleTime(step.scheduledStart)}</td>
+                        <td className="time-cell">{formatScheduleTime(step.scheduledEnd)}</td>
+                        <td className="wait-cell">{step.waitMinutes != null ? `${step.waitMinutes} 分钟` : '—'}</td>
+                        <td><Tag minimal intent={step.scheduleStatus === 'scheduled' ? 'success' : 'warning'}>{step.scheduleStatus === 'scheduled' ? '已排程' : '未排程'}</Tag></td>
+                        <td><div className="gantt-track">{renderGanttBar(step)}</div></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          </section>
+          <aside className="schedule-side">
+            <Card elevation={Elevation.ONE} className="instrument-card">
+              <div className="card-title"><div><span>INSTRUMENTS</span><h3>仪器与工作时间</h3></div><Button icon="add" small text="添加仪器" onClick={addInstrument} /></div>
+              <div className="instrument-list">
+                {process.instruments.map((inst) => (
+                  <div className="instrument-row" key={inst.id}>
+                    <InputGroup className="inst-name" value={inst.name} onChange={(event) => updateInstrument(inst.id, 'name', event.target.value)} />
+                    <InputGroup className="inst-count" type="number" min={1} value={String(inst.count)} onChange={(event) => updateInstrument(inst.id, 'count', event.target.value)} />
+                    <div className="inst-time">
+                      <input type="time" className="bp6-input" value={inst.workStart} onChange={(event) => updateInstrument(inst.id, 'workStart', event.target.value)} />
+                      <span>至</span>
+                      <input type="time" className="bp6-input" value={inst.workEnd} onChange={(event) => updateInstrument(inst.id, 'workEnd', event.target.value)} />
+                    </div>
+                    <Button icon="trash" small minimal intent="danger" onClick={() => removeInstrument(inst.id)} />
+                  </div>
+                ))}
+              </div>
+              <p className="muted">可用台数为同一仪器并行占用上限；工作时间为当天窗口，容量不足时系统将拒绝改写并列出冲突。</p>
+            </Card>
+            <Card elevation={Elevation.ONE} className="schedule-stats-card">
+              <div className="card-title"><div><span>STATS</span><h3>排程统计</h3></div></div>
+              <div className="gate-row"><span>已排程步骤</span><strong>{scheduledCount}/{process.steps.length}</strong></div>
+              <div className="gate-row"><span>未排程步骤</span><strong className={process.steps.length - scheduledCount ? 'danger-text' : ''}>{process.steps.length - scheduledCount}</strong></div>
+              <div className="gate-row"><span>总等待时长</span><strong>{process.steps.reduce((sum, step) => sum + (step.waitMinutes ?? 0), 0)} 分钟</strong></div>
+              <div className="gate-row"><span>仪器台数</span><strong>{process.instruments.reduce((sum, inst) => sum + inst.count, 0)} 台</strong></div>
+              <Divider />
+              <div className="gate-row"><span>排程状态</span><strong className={allScheduled ? '' : 'danger-text'}>{allScheduled ? '全部已排程' : '存在未排程'}</strong></div>
             </Card>
           </aside>
         </main>
@@ -701,8 +987,9 @@ function App() {
             <div className="card-title"><div><span>FREEZE RULES</span><h3>冻结检查</h3></div></div>
             <div className={confirmedCount === process.steps.length ? 'passed' : ''}><Icon icon={confirmedCount === process.steps.length ? 'tick-circle' : 'circle'} /><span><strong>所有步骤已确认</strong><small>{confirmedCount}/{process.steps.length}</small></span></div>
             <div className={!missingSafetySteps.length ? 'passed' : ''}><Icon icon={!missingSafetySteps.length ? 'tick-circle' : 'circle'} /><span><strong>安全信息完整</strong><small>{missingSafetySteps.length} 个缺口</small></span></div>
+            <div className={allScheduled ? 'passed' : ''}><Icon icon="calendar" /><span><strong>全部步骤已排程</strong><small>{scheduledCount}/{process.steps.length} 已排程</small></span></div>
             <div className={process.steps.every((step) => step.dependencies.every((id) => process.steps.some((item) => item.id === id))) ? 'passed' : ''}><Icon icon="git-merge" /><span><strong>依赖引用有效</strong><small>{process.steps.reduce((sum, step) => sum + step.dependencies.length, 0)} 条依赖</small></span></div>
-            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || missingSafetySteps.length > 0} />
+            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || missingSafetySteps.length > 0 || !allScheduled} />
           </Card>
         </main>
       )}
@@ -739,6 +1026,37 @@ function nextMinorVersion(value: string): string {
   return `${match[1]}.${Number(match[2]) + 1}.0`;
 }
 
+const GANTT_SCALE_START_MIN = 8 * 60;  // 08:00
+const GANTT_SCALE_END_MIN = 18 * 60;    // 18:00
+const INSTRUMENT_COLORS = ['#2d72d2', '#0e7c86', '#c87619', '#7d4fc4', '#238551', '#c23030', '#5c6b7a', '#b8860b'];
+
+function colorForInstrument(id: string | undefined): string {
+  if (!id) return '#9aa5b1';
+  let hash = 0;
+  for (const ch of id) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+  return INSTRUMENT_COLORS[hash % INSTRUMENT_COLORS.length];
+}
+
+function minutesOfDay(iso: string): number {
+  const d = new Date(iso);
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+function renderGanttBar(step: ProcessStep): React.ReactNode {
+  if (step.scheduleStatus !== 'scheduled' || !step.scheduledStart || !step.scheduledEnd) return null;
+  const startMin = minutesOfDay(step.scheduledStart);
+  const endMin = minutesOfDay(step.scheduledEnd);
+  const left = Math.max(0, ((startMin - GANTT_SCALE_START_MIN) / (GANTT_SCALE_END_MIN - GANTT_SCALE_START_MIN)) * 100);
+  const width = Math.max(2, ((endMin - startMin) / (GANTT_SCALE_END_MIN - GANTT_SCALE_START_MIN)) * 100);
+  return (
+    <div
+      className="gantt-bar"
+      style={{ left: `${left}%`, width: `${width}%`, background: colorForInstrument(step.instrumentId) }}
+      title={`${step.instrumentName} · ${formatScheduleTime(step.scheduledStart)}–${formatScheduleTime(step.scheduledEnd)}`}
+    />
+  );
+}
+
 function compareVersions(process: ExperimentProcess, baseId: string, targetId: string): DiffItem[] {
   const base = process.versions.find((version) => version.id === baseId);
   const target = process.versions.find((version) => version.id === targetId);
@@ -752,7 +1070,7 @@ function compareVersions(process: ExperimentProcess, baseId: string, targetId: s
   target.steps.forEach((step) => {
     const before = baseMap.get(step.id);
     if (!before) {
-      diffs.push({ id: step.id, title: step.title, kind: 'added', detail: `${step.duration} 分钟；危险项：${step.hazards.join('、') || '无'}` });
+      diffs.push({ id: step.id, title: step.title, kind: 'added', detail: `${step.duration} 分钟；仪器：${step.instrumentName ?? '未排程'}；危险项：${step.hazards.join('、') || '无'}` });
       return;
     }
     const fields: string[] = [];
@@ -765,7 +1083,16 @@ function compareVersions(process: ExperimentProcess, baseId: string, targetId: s
     if (before.controls !== step.controls || before.safetyNote !== step.safetyNote) fields.push('安全控制');
     if (JSON.stringify(before.dependencies) !== JSON.stringify(step.dependencies)) fields.push('依赖关系');
     if (before.expectedResult !== step.expectedResult) fields.push('预期结果');
-    if (fields.length) diffs.push({ id: step.id, title: step.title, kind: 'changed', detail: `变化字段：${fields.join('、')}。` });
+    if (before.instrumentName !== step.instrumentName) fields.push('仪器');
+    if (before.scheduledStart !== step.scheduledStart) fields.push('开始时间');
+    if (before.scheduledEnd !== step.scheduledEnd) fields.push('结束时间');
+    if (before.waitMinutes !== step.waitMinutes) fields.push('等待时长');
+    if (fields.length) {
+      const scheduleInfo = step.scheduleStatus === 'scheduled'
+        ? `仪器：${step.instrumentName}；${formatScheduleTime(step.scheduledStart)} 至 ${formatScheduleTime(step.scheduledEnd)}；等待 ${step.waitMinutes} 分钟`
+        : '未排程';
+      diffs.push({ id: step.id, title: step.title, kind: 'changed', detail: `变化字段：${fields.join('、')}。当前排程：${scheduleInfo}。` });
+    }
   });
   return diffs;
 }

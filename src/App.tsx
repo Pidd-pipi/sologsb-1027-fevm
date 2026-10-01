@@ -10,16 +10,26 @@ import {
   HTMLSelect,
   Icon,
   InputGroup,
+  NumericInput,
   ProgressBar,
   Tab,
   Tabs,
   Tag,
   TextArea
 } from '@blueprintjs/core';
+import {
+  buildSchedule,
+  compareScheduleEntries,
+  formatClock,
+  mergeDateTime,
+  todayDateInput,
+  type Instrument,
+  type ScheduleResult
+} from './scheduler';
 
 type StepStatus = 'draft' | 'submitted' | 'confirmed' | 'returned';
 type ProcessStatus = 'draft' | 'in-review' | 'frozen' | 'revising';
-type ViewId = 'editor' | 'review' | 'compare';
+type ViewId = 'editor' | 'schedule' | 'review' | 'compare';
 
 interface ReviewComment {
   id: string;
@@ -45,6 +55,8 @@ interface ProcessStep {
   expectedResult: string;
   status: StepStatus;
   comments: ReviewComment[];
+  instrumentId?: string; // 排程所选仪器（台账中的一台仪器类型）
+  earliestStart?: string; // 不可早于时间，datetime-local：YYYY-MM-DDTHH:mm
 }
 
 interface VersionSnapshot {
@@ -55,6 +67,9 @@ interface VersionSnapshot {
   note: string;
   author: string;
   steps: ProcessStep[];
+  instruments: Instrument[];
+  scheduleDate: string;
+  schedule?: ScheduleResult; // 冻结时刻的有效排程快照；旧版本无此字段即视为未排程
 }
 
 interface ExperimentProcess {
@@ -68,6 +83,9 @@ interface ExperimentProcess {
   version: string;
   steps: ProcessStep[];
   versions: VersionSnapshot[];
+  instruments: Instrument[];
+  scheduleDate: string; // 当天排程日期 YYYY-MM-DD
+  lastValidSchedule?: ScheduleResult; // 最近一次有效排程；输入变更导致失效时保留，作为拒绝改写的回退
   frozenAt?: string;
   updatedAt: string;
 }
@@ -85,22 +103,31 @@ interface DiffItem {
   detail: string;
 }
 
-const STORAGE_KEY = 'sologsb-1027-lab-safety-v1';
+const STORAGE_KEY = 'sologsb-1027-lab-safety-v2';
 const CURRENT_AUTHOR = '周宁';
 const CURRENT_ROLE = '安全复核员';
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+
+const DEFAULT_INSTRUMENTS: Instrument[] = [
+  { id: 'inst-hood', name: '通风柜', capacity: 2, workStart: '08:30', workEnd: '18:00' },
+  { id: 'inst-bath', name: '恒温循环浴', capacity: 1, workStart: '08:30', workEnd: '18:00' },
+  { id: 'inst-balance', name: '分析天平', capacity: 1, workStart: '08:30', workEnd: '17:30' },
+  { id: 'inst-gc', name: '气相色谱', capacity: 1, workStart: '09:00', workEnd: '17:00' }
+];
 
 function uid(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
 function initialProcess(): ExperimentProcess {
+  const today = todayDateInput();
   const baseSteps: ProcessStep[] = [
     {
       id: 'step-1', title: '核对试剂与实验区域', purpose: '确认所需物料、设备及区域状态符合实验方案。',
       materials: '无水乙醇、去离子水', equipment: '通风柜、防爆柜、标签打印机', amount: '乙醇 120 mL；去离子水 300 mL',
       duration: 15, hazards: ['易燃液体'], controls: '在通风柜内取用，远离点火源；使用接地金属容器。',
       dependencies: [], safetyNote: '操作人员需佩戴护目镜和防化手套。', expectedResult: '试剂标签、数量和有效期均核对无误。',
+      instrumentId: 'inst-hood', earliestStart: mergeDateTime(today, '08:30'),
       status: 'confirmed', comments: [
         { id: 'c-1', author: '李明', role: '研究员', text: '已核对批号和有效期，防爆柜温度记录正常。', createdAt: '2026-09-24T09:10:00+08:00', resolved: true }
       ]
@@ -110,6 +137,7 @@ function initialProcess(): ExperimentProcess {
       materials: '无', equipment: '恒温循环浴、硅胶管、反应夹套、扎带', amount: '循环液 800 mL',
       duration: 25, hazards: ['烫伤', '管路脱落'], controls: '管路双端固定；升温前完成 5 分钟试压并设置独立超温断电。',
       dependencies: ['step-1'], safetyNote: '高温表面设置警示标识，循环浴周围保持干燥。', expectedResult: '30 分钟内温度稳定在 55 ± 0.5 ℃。',
+      instrumentId: 'inst-bath',
       status: 'confirmed', comments: [
         { id: 'c-2', author: '王颖', role: '安全复核员', text: '补充超温断电值，不能只依赖设备自带温控。', createdAt: '2026-09-24T10:05:00+08:00', resolved: true }
       ]
@@ -119,6 +147,7 @@ function initialProcess(): ExperimentProcess {
       materials: '催化剂 A', equipment: '分析天平、加料漏斗、计时器', amount: '催化剂 A 2.50 ± 0.02 g',
       duration: 20, hazards: ['粉尘吸入', '放热反应'], controls: '在通风柜内称量，佩戴 N95 口罩；分三次少量加入并监测温度。',
       dependencies: ['step-2'], safetyNote: '反应温度超过 70 ℃ 时立即停止加料并启动冷却。', expectedResult: '温度缓慢升至 62–66 ℃，无明显冲料。',
+      instrumentId: 'inst-balance',
       status: 'submitted', comments: []
     },
     {
@@ -126,6 +155,7 @@ function initialProcess(): ExperimentProcess {
       materials: '样品瓶、惰性气体', equipment: '取样针、气相色谱、恒温循环浴', amount: '每点样品约 1 mL，共 6 点',
       duration: 90, hazards: ['高温液体', '挥发性气体'], controls: '取样前泄压；使用长针和防护屏；样品瓶及时封闭。',
       dependencies: ['step-3'], safetyNote: '取样时不得正对瓶口，样品瓶不得完全密封后加热。', expectedResult: '转化率达到 95% 以上且无异常副产物。',
+      instrumentId: 'inst-bath', earliestStart: mergeDateTime(today, '10:30'),
       status: 'submitted', comments: []
     },
     {
@@ -133,6 +163,7 @@ function initialProcess(): ExperimentProcess {
       materials: '无', equipment: '循环浴、温度探头', amount: '降温目标 ≤ 30 ℃', duration: 35,
       hazards: ['烫伤', '残余反应'], controls: '先停止加料并维持搅拌，再以不超过 1 ℃/min 的速率降温。',
       dependencies: ['step-4'], safetyNote: '确认温度连续 5 分钟低于 30 ℃ 后才能拆除装置。', expectedResult: '体系温度稳定低于 30 ℃。',
+      instrumentId: 'inst-bath',
       status: 'draft', comments: []
     },
     {
@@ -140,6 +171,7 @@ function initialProcess(): ExperimentProcess {
       materials: '废液桶、吸附棉', equipment: '防化手套、护目镜、危废标签', amount: '按实际产生量记录', duration: 25,
       hazards: ['废液混装', '化学暴露'], controls: '有机废液单独收集，核对相容性后贴标签；泄漏吸附材料按危废处置。',
       dependencies: ['step-5'], safetyNote: '废液不得倒入下水道，现场恢复后完成双人确认。', expectedResult: '废液交接记录完整，台面无残留。',
+      instrumentId: 'inst-hood',
       status: 'draft', comments: []
     }
   ];
@@ -147,20 +179,24 @@ function initialProcess(): ExperimentProcess {
   const firstVersion: VersionSnapshot = {
     id: 'version-1-0', label: '首版批准流程', version: '1.0.0', createdAt: '2026-09-20T14:30:00+08:00',
     note: '建立基础反应与取样步骤。', author: '王颖',
-    steps: clone(baseSteps).slice(0, 4).map((step) => ({ ...step, status: 'confirmed', comments: [] }))
+    steps: clone(baseSteps).slice(0, 4).map((step) => ({ ...step, status: 'confirmed', comments: [], instrumentId: undefined, earliestStart: undefined })),
+    instruments: [], scheduleDate: ''
   };
   const secondVersion: VersionSnapshot = {
     id: 'version-1-1', label: '补充冷却与废液步骤', version: '1.1.0', createdAt: '2026-09-24T15:10:00+08:00',
     note: '增加安全冷却、废液处置和现场恢复。', author: '王颖',
-    steps: clone(baseSteps).map((step) => ({ ...step, status: 'confirmed', comments: [] }))
+    steps: clone(baseSteps).map((step) => ({ ...step, status: 'confirmed', comments: [], instrumentId: undefined, earliestStart: undefined })),
+    instruments: [], scheduleDate: ''
   };
 
   return {
     id: 'exp-catalyst-2026-09', title: '负载型催化剂评价实验', code: 'SAFE-CAT-026',
-    objective: '在受控温度下评价催化剂活性，并完整记录过程样品与安全控制措施。',
+    objective: '在受控温度下评价催化剂活性，并完整记录过程样品与安全复核。',
     principal: '李明', lab: '材料化学实验室 B-207',
     status: 'in-review', version: '1.2.0-draft',
-    steps: baseSteps, versions: [firstVersion, secondVersion], updatedAt: new Date().toISOString()
+    steps: baseSteps, versions: [firstVersion, secondVersion],
+    instruments: clone(DEFAULT_INSTRUMENTS), scheduleDate: today,
+    updatedAt: new Date().toISOString()
   };
 }
 
@@ -171,10 +207,18 @@ function historyReducer(state: HistoryState, action:
   | { type: 'reset'; value: ExperimentProcess }
 ): HistoryState {
   if (action.type === 'commit') {
+    const previous = clone(state.present);
     const next = clone(state.present);
     action.update(next);
     next.updatedAt = new Date().toISOString();
-    return { past: [...state.past.slice(-59), clone(state.present)], present: next, future: [] };
+    // 输入一变立即重算：有效则刷新受影响排程；当天窗口容量不足时拒绝改写，保留改动前的有效排程。
+    const recomputed = buildSchedule(next.scheduleDate, next.instruments, next.steps);
+    if (recomputed.valid) {
+      next.lastValidSchedule = recomputed;
+    } else {
+      next.lastValidSchedule = previous.lastValidSchedule;
+    }
+    return { past: [...state.past.slice(-59), previous], present: next, future: [] };
   }
   if (action.type === 'undo') {
     const previous = state.past.at(-1);
@@ -189,15 +233,70 @@ function historyReducer(state: HistoryState, action:
   return { past: [], present: action.value, future: [] };
 }
 
+function migrateProcess(value: Partial<ExperimentProcess>): ExperimentProcess {
+  const today = todayDateInput();
+  const steps = Array.isArray(value.steps) ? value.steps : [];
+  // 旧数据升级：历史步骤没有仪器选择，清除排程字段并在打开后标为未排程。
+  const migratedSteps = steps.map((step) => ({
+    ...step,
+    instrumentId: typeof step.instrumentId === 'string' ? step.instrumentId : undefined,
+    earliestStart: typeof step.earliestStart === 'string' ? step.earliestStart : undefined
+  }));
+  // 旧版本快照同样升级：不重算排程，缺少 schedule 即按未排程展示。
+  const migratedVersions = Array.isArray(value.versions)
+    ? value.versions.map((version) => ({
+        ...version,
+        instruments: Array.isArray(version.instruments) ? version.instruments : [],
+        scheduleDate: typeof version.scheduleDate === 'string' ? version.scheduleDate : '',
+        schedule: version.schedule,
+        steps: version.steps.map((step) => ({
+          ...step,
+          instrumentId: typeof step.instrumentId === 'string' ? step.instrumentId : undefined,
+          earliestStart: typeof step.earliestStart === 'string' ? step.earliestStart : undefined
+        }))
+      }))
+    : [];
+  return {
+    id: value.id || uid('exp'),
+    title: value.title || '未命名实验',
+    code: value.code || '',
+    objective: value.objective || '',
+    principal: value.principal || '',
+    lab: value.lab || '',
+    status: value.status || 'draft',
+    version: value.version || '1.0.0-draft',
+    steps: migratedSteps,
+    versions: migratedVersions,
+    instruments: Array.isArray(value.instruments) && value.instruments.length ? value.instruments : clone(DEFAULT_INSTRUMENTS),
+    scheduleDate: typeof value.scheduleDate === 'string' && value.scheduleDate ? value.scheduleDate : today,
+    lastValidSchedule: value.lastValidSchedule,
+    frozenAt: value.frozenAt,
+    updatedAt: value.updatedAt || new Date().toISOString()
+  };
+}
+
 function loadProcess(): ExperimentProcess {
+  let base: ExperimentProcess;
   try {
-    const value = localStorage.getItem(STORAGE_KEY);
-    if (!value) return initialProcess();
-    const parsed = JSON.parse(value) as ExperimentProcess;
-    return parsed.id && Array.isArray(parsed.steps) ? parsed : initialProcess();
+    const value = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem('sologsb-1027-lab-safety-v1');
+    if (!value) {
+      base = initialProcess();
+    } else {
+      const parsed = JSON.parse(value) as Partial<ExperimentProcess>;
+      if (!parsed.id || !Array.isArray(parsed.steps)) {
+        base = initialProcess();
+      } else {
+        // 旧数据升级：历史步骤缺少仪器选择，升级后照常打开并由下方重算标为未排程/冲突。
+        base = migrateProcess(parsed);
+      }
+    }
   } catch {
-    return initialProcess();
+    base = initialProcess();
   }
+  // 打开即按当前台账与步骤重算：有效则展示排程，无效则全部标为未排程/冲突，不写入半截时间。
+  const loaded = buildSchedule(base.scheduleDate, base.instruments, base.steps);
+  base.lastValidSchedule = loaded.valid ? loaded : undefined;
+  return base;
 }
 
 function splitList(value: string): string[] {
@@ -217,6 +316,97 @@ function formatDate(value: string): string {
   return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat('zh-CN', {
     month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false
   }).format(date);
+}
+
+function conflictLabel(reason: string): string {
+  const labels: Record<string, string> = {
+    cycle: '依赖成环',
+    'bad-duration': '时长无效',
+    'unknown-instrument': '仪器缺失',
+    'instrument-config': '台账配置',
+    'dep-blocked': '依赖未排程',
+    'earliest-future': '超出当天',
+    overflow: '窗口溢出'
+  };
+  return labels[reason] ?? '冲突';
+}
+
+interface GanttProps {
+  instruments: Instrument[];
+  schedule: ScheduleResult;
+  selectedStepId: string;
+  onSelectStep: (stepId: string) => void;
+  conflictStepIds: Set<string>;
+}
+
+function ScheduleGantt({ instruments, schedule, selectedStepId, onSelectStep, conflictStepIds }: GanttProps) {
+  // 时间轴范围：取所有仪器窗口与实际任务端点的并集，越界段同样可见。
+  const bounds = instruments.flatMap((instrument) => {
+    const start = /^(\d{1,2}):(\d{2})$/.exec(instrument.workStart);
+    const end = /^(\d{1,2}):(\d{2})$/.exec(instrument.workEnd);
+    return [
+      start ? Number(start[1]) * 60 + Number(start[2]) : 8 * 60,
+      end ? Number(end[1]) * 60 + Number(end[2]) : 18 * 60
+    ];
+  });
+  schedule.entries.forEach((entry) => { bounds.push(entry.start, entry.end); });
+  if (!bounds.length) { bounds.push(8 * 60, 18 * 60); }
+  const axisStart = Math.floor(Math.min(...bounds) / 30) * 30;
+  const axisEnd = Math.ceil(Math.max(...bounds) / 30) * 30;
+  const span = Math.max(60, axisEnd - axisStart);
+  const tickCount = Math.round(span / 30);
+  const percent = (minute: number) => ((minute - axisStart) / span) * 100;
+
+  return (
+    <div className="gantt">
+      <div className="gantt-axis" style={{ paddingLeft: 132 }}>
+        {Array.from({ length: tickCount + 1 }, (_, index) => axisStart + index * 30).map((minute) => (
+          <span key={minute} className="gantt-tick" style={{ left: `${percent(minute)}%` }}>{formatClock(minute)}</span>
+        ))}
+      </div>
+      {instruments.map((instrument) => {
+        const workStart = /^(\d{1,2}):(\d{2})$/.exec(instrument.workStart);
+        const workEnd = /^(\d{1,2}):(\d{2})$/.exec(instrument.workEnd);
+        const winStart = workStart ? Number(workStart[1]) * 60 + Number(workStart[2]) : axisStart;
+        const winEnd = workEnd ? Number(workEnd[1]) * 60 + Number(workEnd[2]) : axisEnd;
+        const lanes = Array.from({ length: Math.max(1, instrument.capacity) }, (_, lane) =>
+          schedule.entries.filter((entry) => entry.instrumentId === instrument.id && entry.lane === lane)
+        );
+        return (
+          <div className="gantt-row" key={instrument.id}>
+            <div className="gantt-label">
+              <strong>{instrument.name}</strong>
+              <small>{instrument.capacity} 台 · {instrument.workStart}–{instrument.workEnd}</small>
+            </div>
+            <div className="gantt-lanes">
+              <div className="gantt-window" style={{ left: `${percent(winStart)}%`, width: `${Math.max(0, percent(winEnd) - percent(winStart))}%` }} />
+              {lanes.map((entries, laneIndex) => (
+                <div className="gantt-lane" key={laneIndex}>
+                  {entries.map((entry) => {
+                    const overflow = entry.end > winEnd;
+                    const isConflict = Boolean(conflictStepIds.has(entry.stepId)) || overflow;
+                    return (
+                      <button
+                        key={entry.stepId}
+                        className={`gantt-block ${isConflict ? 'overflow' : ''} ${entry.stepId === selectedStepId ? 'selected' : ''}`}
+                        style={{ left: `${percent(entry.start)}%`, width: `${Math.max(1.2, percent(entry.end) - percent(entry.start))}%` }}
+                        title={`${entry.instrumentName} #${entry.lane + 1} · ${formatClock(entry.start)}–${formatClock(entry.end)}${entry.wait ? ` · 等待 ${entry.wait} 分` : ''}`}
+                        onClick={() => onSelectStep(entry.stepId)}
+                      >
+                        <span className="gantt-block-time">{formatClock(entry.start)}–{formatClock(entry.end)}</span>
+                        {entry.wait > 0 && <span className="gantt-block-wait">等{entry.wait}′</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+      {!instruments.length && <p className="muted">维护仪器后台账后这里显示按台位分行的占用时间线。</p>}
+    </div>
+  );
 }
 
 function App() {
@@ -239,7 +429,27 @@ function App() {
   const pendingReviewCount = process.steps.filter((step) => step.status === 'submitted' || step.status === 'returned').length;
   const confirmedCount = process.steps.filter((step) => step.status === 'confirmed').length;
   const reviewProgress = process.steps.length ? Math.round((confirmedCount / process.steps.length) * 100) : 0;
+  // 试算排程：任一输入（时长/依赖/仪器/不可早于/台数/工作时间）变化立即失效重算。
+  const trialSchedule = useMemo(
+    () => buildSchedule(process.scheduleDate, process.instruments, process.steps),
+    [process.scheduleDate, process.instruments, process.steps]
+  );
+  // 有效排程以最近一次通过窗口校验的结果为准；失效时保留改动前结果，不写入半截时间。
+  const activeSchedule = trialSchedule.valid ? trialSchedule : process.lastValidSchedule;
+  const scheduleInvalid = !trialSchedule.valid;
+  const conflictStepIds = new Set(trialSchedule.conflicts.map((conflict) => conflict.stepId).filter((id): id is string => Boolean(id)));
+  const scheduleEntryMap = useMemo(() => new Map((activeSchedule?.entries ?? []).map((entry) => [entry.stepId, entry])), [activeSchedule]);
   const versionDiff = useMemo(() => compareVersions(process, compareBaseId, compareTargetId), [process, compareBaseId, compareTargetId]);
+  const scheduleDiff = useMemo(() => {
+    const base = process.versions.find((version) => version.id === compareBaseId);
+    const target = process.versions.find((version) => version.id === compareTargetId);
+    return compareScheduleEntries(
+      base?.schedule,
+      target?.schedule,
+      base?.steps ?? [],
+      target?.steps ?? []
+    );
+  }, [process.versions, compareBaseId, compareTargetId]);
 
   useEffect(() => {
     if (!initialSaveSkipped.current) {
@@ -310,7 +520,8 @@ function App() {
       draft.steps.push({
         id, title: '新的实验步骤', purpose: '', materials: '', equipment: '', amount: '', duration: 10,
         hazards: [], controls: '', dependencies: draft.steps.at(-1) ? [draft.steps.at(-1)!.id] : [],
-        safetyNote: '', expectedResult: '', status: 'draft', comments: []
+        safetyNote: '', expectedResult: '', status: 'draft', comments: [],
+        instrumentId: undefined, earliestStart: undefined
       });
       draft.status = 'draft';
     });
@@ -411,14 +622,22 @@ function App() {
       setSavedLabel('冻结条件未满足');
       return;
     }
+    if (scheduleInvalid || !trialSchedule || trialSchedule.unscheduledStepIds.length > 0) {
+      setSavedLabel('排程未全部生效，已拒绝冻结');
+      setActiveView('schedule');
+      return;
+    }
     const nextNumber = nextMinorVersion(process.version);
     const previousVersionId = process.versions.at(-1)?.id ?? '';
     const frozenVersionId = uid('version');
     commitProcess((draft) => {
+      const schedule = buildSchedule(draft.scheduleDate, draft.instruments, draft.steps);
       draft.versions.push({
         id: frozenVersionId, label: '复核通过冻结版', version: nextNumber,
-        createdAt: new Date().toISOString(), note: `${draft.steps.length} 个步骤全部确认，安全控制完整。`,
-        author: CURRENT_AUTHOR, steps: clone(draft.steps)
+        createdAt: new Date().toISOString(), note: `${draft.steps.length} 个步骤全部确认，安全控制完整，当天排程已生效。`,
+        author: CURRENT_AUTHOR, steps: clone(draft.steps),
+        instruments: clone(draft.instruments), scheduleDate: draft.scheduleDate,
+        schedule: schedule.valid ? clone(schedule) : undefined
       });
       draft.version = nextNumber;
       draft.status = 'frozen';
@@ -445,12 +664,77 @@ function App() {
     setSavedLabel('已从冻结版本创建修订稿');
   };
 
-  const addVersionSnapshot = (): void => {
+  const updateStepScheduleField = (field: 'instrumentId' | 'earliestStart', value: string): void => {
+    if (!selectedStep) return;
+    const id = selectedStep.id;
+    setLastModifiedId(id);
     commitProcess((draft) => {
+      const step = draft.steps.find((item) => item.id === id);
+      if (!step) return;
+      if (field === 'instrumentId') step.instrumentId = value || undefined;
+      else step.earliestStart = value || undefined;
+    });
+  };
+
+  const updateInstrument = (instrumentId: string, field: keyof Instrument, value: string | number): void => {
+    if (process.status === 'frozen') return;
+    commitProcess((draft) => {
+      const instrument = draft.instruments.find((item) => item.id === instrumentId);
+      if (instrument) (instrument as unknown as Record<string, string | number>)[field] = value;
+    });
+    setSavedLabel('仪器台账变更，排程已重算');
+  };
+
+  const addInstrument = (): void => {
+    if (process.status === 'frozen') return;
+    const id = uid('inst');
+    commitProcess((draft) => {
+      draft.instruments.push({ id, name: '新仪器', capacity: 1, workStart: '09:00', workEnd: '17:00' });
+    });
+    setSavedLabel('已新增仪器，请维护台数与工作时间');
+  };
+
+  const deleteInstrument = (instrumentId: string): void => {
+    if (process.status === 'frozen') return;
+    const usedBy = process.steps.filter((step) => step.instrumentId === instrumentId);
+    commitProcess((draft) => {
+      draft.instruments = draft.instruments.filter((instrument) => instrument.id !== instrumentId);
+      draft.steps.forEach((step) => {
+        if (step.instrumentId === instrumentId) step.instrumentId = undefined;
+      });
+    });
+    setSavedLabel(usedBy.length ? `仪器已删除，${usedBy.length} 个步骤变为未排程` : '仪器已删除');
+  };
+
+  const updateScheduleDate = (value: string): void => {
+    if (!value || process.status === 'frozen') return;
+    commitProcess((draft) => {
+      draft.scheduleDate = value;
+      // 换天：不属于当天的不可早于时间不再约束排程，但保留原值以便切回。
+    });
+  };
+
+  const useTodaySchedule = (): void => {
+    updateScheduleDate(todayDateInput());
+    setSavedLabel(`已切换到今天 ${todayDateInput()}，排程已重算`);
+  };
+
+  const addVersionSnapshot = (): void => {
+    if (scheduleInvalid) {
+      setSavedLabel('排程存在冲突，已拒绝写入版本快照');
+      setActiveView('schedule');
+      return;
+    }
+    commitProcess((draft) => {
+      const schedule = buildSchedule(draft.scheduleDate, draft.instruments, draft.steps);
+      const unscheduled = schedule.unscheduledStepIds.length;
       draft.versions.push({
         id: uid('version'), label: '工作版本快照', version: draft.version.replace('-draft', ''),
-        createdAt: new Date().toISOString(), note: '保存当前步骤与复核状态。',
-        author: CURRENT_AUTHOR, steps: clone(draft.steps)
+        createdAt: new Date().toISOString(),
+        note: unscheduled ? `保存当前步骤与复核状态；${unscheduled} 个步骤未排程。` : '保存当前步骤、复核状态与当天排程。',
+        author: CURRENT_AUTHOR, steps: clone(draft.steps),
+        instruments: clone(draft.instruments), scheduleDate: draft.scheduleDate,
+        schedule: schedule.valid ? clone(schedule) : undefined
       });
     });
     setSavedLabel('已保存工作版本快照');
@@ -461,7 +745,7 @@ function App() {
       <header className="app-header">
         <div className="brand-block">
           <div className="brand-icon"><Icon icon="lab-test" size={23} /></div>
-          <div><h1>实验流程安全复核台</h1><p>步骤影响分析 · 逐条复核 · 冻结版本</p></div>
+          <div><h1>实验流程安全复核台</h1><p>步骤影响分析 · 当日仪器排程 · 逐条复核 · 冻结版本</p></div>
         </div>
         <div className="header-status">
           <span className={`network ${online ? 'online' : ''}`}></span>
@@ -498,6 +782,10 @@ function App() {
 
       <Tabs id="workspace-tabs" selectedTabId={activeView} onChange={(value) => setActiveView(value as ViewId)} renderActiveTabPanelOnly className="workspace-tabs">
         <Tab id="editor" title={<span><Icon icon="edit" /> 流程编写</span>} />
+        <Tab
+          id="schedule"
+          title={<span><Icon icon="time" /> 当天排程{scheduleInvalid ? <b className="tab-badge">!</b> : trialSchedule.unscheduledStepIds.length > 0 ? <b className="tab-badge tab-badge-muted">{trialSchedule.unscheduledStepIds.length}</b> : null}</span>}
+        />
         <Tab id="review" title={<span><Icon icon="endorsed" /> 安全复核 {pendingReviewCount > 0 && <b className="tab-badge">{pendingReviewCount}</b>}</span>} />
         <Tab id="compare" title={<span><Icon icon="comparison" /> 版本比较</span>} />
       </Tabs>
@@ -550,6 +838,26 @@ function App() {
                 <FormGroup label="设备" labelFor="equipment"><TextArea id="equipment" fill value={selectedStep.equipment} onChange={(event) => updateStep('equipment', event.target.value)} /></FormGroup>
                 <FormGroup label="用量 / 参数" labelFor="amount"><TextArea id="amount" fill value={selectedStep.amount} onChange={(event) => updateStep('amount', event.target.value)} /></FormGroup>
                 <FormGroup label="预计时间（分钟）" labelFor="duration"><InputGroup id="duration" type="number" min={1} fill value={String(selectedStep.duration)} onChange={(event) => updateStep('duration', Number(event.target.value))} /></FormGroup>
+              </div>
+              <div className="form-grid schedule-field-grid">
+                <FormGroup label="排程仪器（决定台数与工作时间）" labelFor="step-instrument" helperText="不选仪器的步骤标记为未排程，不参与当天占用。">
+                  <HTMLSelect
+                    id="step-instrument" fill value={selectedStep.instrumentId ?? ''}
+                    onChange={(event) => updateStepScheduleField('instrumentId', event.target.value)}
+                  >
+                    <option value="">（未选择 · 未排程）</option>
+                    {process.instruments.map((instrument) => (
+                      <option key={instrument.id} value={instrument.id}>{instrument.name} · {instrument.capacity} 台 · {instrument.workStart}–{instrument.workEnd}</option>
+                    ))}
+                  </HTMLSelect>
+                </FormGroup>
+                <FormGroup label="不可早于时间" labelFor="step-earliest" helperText={`仅约束排程当天 ${process.scheduleDate}；留空表示仅受前置步骤限制。`}>
+                  <InputGroup
+                    id="step-earliest" type="datetime-local" fill
+                    value={selectedStep.earliestStart ?? ''}
+                    onChange={(event) => updateStepScheduleField('earliestStart', event.target.value)}
+                  />
+                </FormGroup>
               </div>
               <div className="form-grid two-column">
                 <FormGroup label="危险项（逗号或换行分隔）" labelFor="hazards"><TextArea id="hazards" fill value={selectedStep.hazards.join('，')} onChange={(event) => updateStepList('hazards', event.target.value)} /></FormGroup>
@@ -610,6 +918,135 @@ function App() {
               {process.status === 'frozen' ? <Button fill intent="warning" icon="git-branch" text="从冻结版创建修订" onClick={startRevision} /> : <Button fill intent="primary" icon="send-to" text="提交复核" onClick={submitForReview} />}
             </Card>
           </aside>
+        </main>
+      )}
+
+      {activeView === 'schedule' && (
+        <main className="schedule-layout">
+          <Card elevation={Elevation.ONE} className="instrument-card">
+            <div className="card-title">
+              <div><span>INSTRUMENTS</span><h3>仪器台账</h3></div>
+              <Button icon="add" small minimal text="新增仪器" onClick={addInstrument} disabled={process.status === 'frozen'} />
+            </div>
+            <p className="muted">维护每台仪器的可用台数与当天工作时间；同一仪器并行占用不超过台数，步骤只能排在工作窗口内。</p>
+            <div className="instrument-list">
+              <div className="instrument-row instrument-head"><span>仪器</span><span>台数</span><span>上班</span><span>下班</span><span></span></div>
+              {process.instruments.map((instrument) => {
+                const gap = trialSchedule.gaps.find((item) => item.instrumentId === instrument.id);
+                return (
+                  <div className="instrument-row" key={instrument.id}>
+                    <InputGroup fill small value={instrument.name} disabled={process.status === 'frozen'} onChange={(event) => updateInstrument(instrument.id, 'name', event.target.value)} placeholder="仪器名称" />
+                    <NumericInput small fill min={1} max={20} value={instrument.capacity} disabled={process.status === 'frozen'} onValueChange={(value) => updateInstrument(instrument.id, 'capacity', Number.isFinite(value) ? Math.max(1, Math.round(value)) : 1)} />
+                    <InputGroup small type="time" value={instrument.workStart} disabled={process.status === 'frozen'} onChange={(event) => updateInstrument(instrument.id, 'workStart', event.target.value)} />
+                    <InputGroup small type="time" value={instrument.workEnd} disabled={process.status === 'frozen'} onChange={(event) => updateInstrument(instrument.id, 'workEnd', event.target.value)} />
+                    <Button small minimal icon="trash" intent="danger" disabled={process.status === 'frozen'} onClick={() => deleteInstrument(instrument.id)} />
+                    {gap && <small className="instrument-gap">峰值并行 {gap.peakOverlap}/{gap.capacity} 台；窗口外缺口 {gap.shortfall} 分钟</small>}
+                  </div>
+                );
+              })}
+              {!process.instruments.length && <p className="muted">尚无仪器，请新增仪器并维护台数与工作时间。</p>}
+            </div>
+          </Card>
+
+          <Card elevation={Elevation.ONE} className="timeline-card">
+            <div className="card-title">
+              <div><span>SCHEDULE DATE · {process.scheduleDate}</span><h3>当天排程时间线</h3></div>
+              <div className="schedule-date-controls">
+                <InputGroup type="date" small value={process.scheduleDate} onChange={(event) => updateScheduleDate(event.target.value)} disabled={process.status === 'frozen'} />
+                <Button small minimal icon="calendar" text="回到今天" onClick={useTodaySchedule} disabled={process.status === 'frozen'} />
+              </div>
+            </div>
+
+            {scheduleInvalid && (
+              <Callout intent="danger" icon="warning-sign" className="schedule-conflict-callout" title="排程已失效：改动已保留，但不会写入版本快照，也不允许冻结">
+                <p>系统按最新输入重算后无法在当天窗口内完成。下表时间线为试算结果（红色为越界步骤），改动前的有效排程仍保留：{activeSchedule ? `截至 ${formatClock(activeSchedule.windowStart)}–${formatClock(activeSchedule.windowEnd)} 的版本` : '本次会话尚无有效排程'}。</p>
+                <ul className="conflict-list">
+                  {trialSchedule.conflicts.map((conflict, index) => {
+                    const step = process.steps.find((item) => item.id === conflict.stepId);
+                    return (
+                      <li key={`${conflict.reason}-${conflict.stepId ?? conflict.instrumentId ?? index}`}>
+                        <Tag minimal intent="danger">{conflictLabel(conflict.reason)}</Tag>
+                        <button className="conflict-step-link" disabled={!step} onClick={() => step && (setSelectedStepId(step.id), setActiveView('editor'))}>{step ? step.title : '仪器台账'}</button>
+                        <span>{conflict.message}</span>
+                        {typeof conflict.overflow === 'number' && conflict.overflow > 0 && <strong>缺口 {Math.round(conflict.overflow)} 分钟</strong>}
+                      </li>
+                    );
+                  })}
+                </ul>
+                {trialSchedule.gaps.length > 0 && (
+                  <div className="gap-box">
+                    {trialSchedule.gaps.map((gap) => (
+                      <span key={gap.instrumentId}><strong>{gap.instrumentName}</strong>：{gap.capacity} 台，峰值并行 {gap.peakOverlap} 台，容量缺口 {gap.shortfall} 分钟（需加班、增台或削减任务）。</span>
+                    ))}
+                  </div>
+                )}
+              </Callout>
+            )}
+            {!scheduleInvalid && trialSchedule.unscheduledStepIds.length > 0 && (
+              <Callout intent="warning" icon="time" className="schedule-conflict-callout" title={`${trialSchedule.unscheduledStepIds.length} 个步骤未排程`}>
+                <p>以下步骤未选择仪器，不占用当天容量；全部步骤排程生效后才能冻结版本。</p>
+                <ul className="conflict-list">
+                  {trialSchedule.unscheduledStepIds.map((id) => {
+                    const step = process.steps.find((item) => item.id === id);
+                    return (
+                      <li key={id}>
+                        <Tag minimal intent="warning">未排程</Tag>
+                        <button className="conflict-step-link" onClick={() => { if (step) { setSelectedStepId(step.id); setActiveView('editor'); } }}>{step?.title ?? id}</button>
+                        <span>请在流程编写中为该步骤选择仪器。</span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </Callout>
+            )}
+            {!scheduleInvalid && trialSchedule.unscheduledStepIds.length === 0 && (
+              <Callout intent="success" icon="tick-circle" className="schedule-conflict-callout" title={`排程有效 · 所有步骤均可在 ${process.scheduleDate} 的仪器窗口内完成`}>
+                <p>开始、结束与等待时长均由依赖关系、不可早于时间和仪器台数自动推算；任一输入变化会立即重算。</p>
+              </Callout>
+            )}
+
+            <ScheduleGantt
+              instruments={process.instruments}
+              schedule={trialSchedule}
+              selectedStepId={selectedStep?.id ?? ''}
+              onSelectStep={(id) => { setSelectedStepId(id); }}
+              conflictStepIds={conflictStepIds}
+            />
+          </Card>
+
+          <Card elevation={Elevation.ONE} className="schedule-table-card">
+            <div className="card-title"><div><span>STEP TIMES</span><h3>步骤排程明细</h3></div><Tag minimal intent={scheduleInvalid ? 'danger' : trialSchedule.unscheduledStepIds.length ? 'warning' : 'success'}>{scheduleInvalid ? '已失效' : trialSchedule.unscheduledStepIds.length ? '部分未排程' : '已生效'}</Tag></div>
+            <div className="schedule-table">
+              <div className="schedule-row schedule-head"><span>步骤</span><span>仪器</span><span>开始</span><span>结束</span><span>等待</span><span>状态</span></div>
+              {process.steps.map((step, index) => {
+                const entry = scheduleEntryMap.get(step.id);
+                const isConflict = conflictStepIds.has(step.id);
+                const unscheduled = !entry || trialSchedule.unscheduledStepIds.includes(step.id);
+                const instrument = process.instruments.find((item) => item.id === step.instrumentId);
+                return (
+                  <button
+                    key={step.id}
+                    className={`schedule-row ${step.id === selectedStep?.id ? 'selected' : ''} ${isConflict ? 'conflict' : ''} ${unscheduled ? 'unscheduled' : ''}`}
+                    onClick={() => setSelectedStepId(step.id)}
+                  >
+                    <span><b>{String(index + 1).padStart(2, '0')}</b> {step.title}</span>
+                    <span>{instrument?.name ?? '—'}</span>
+                    <span className="mono">{entry ? formatClock(entry.start) : '—'}</span>
+                    <span className="mono">{entry ? formatClock(entry.end) : '—'}</span>
+                    <span className="mono">{entry && entry.wait > 0 ? `${entry.wait} 分` : entry ? '0 分' : '—'}</span>
+                    <span>{isConflict ? <Tag minimal intent="danger">冲突</Tag> : unscheduled ? <Tag minimal intent="warning">未排程</Tag> : <Tag minimal intent="success">已排入</Tag>}</span>
+                  </button>
+                );
+              })}
+            </div>
+            <p className="muted" style={{ marginTop: 10 }}>
+              {scheduleInvalid
+                ? '排程失效期间冻结与版本快照均被拒绝，改动前的有效排程继续保留，避免半截时间进入版本。'
+                : activeSchedule
+                  ? `当前生效排程版本：${activeSchedule.entries.length} 个步骤，窗口 ${formatClock(activeSchedule.windowStart)}–${formatClock(activeSchedule.windowEnd)}。`
+                  : '尚无生效排程。'}
+            </p>
+          </Card>
         </main>
       )}
 
@@ -680,7 +1117,9 @@ function App() {
             <div className="version-timeline">
               {process.versions.map((version, index) => (
                 <article key={version.id} className={index === process.versions.length - 1 ? 'latest' : ''}>
-                  <span></span><div><b>{version.version}</b><strong>{version.label}</strong><p>{formatDate(version.createdAt)} · {version.steps.length} 个步骤 · {version.author}</p><small>{version.note}</small></div>
+                  <span></span><div><b>{version.version}</b><strong>{version.label}</strong><p>{formatDate(version.createdAt)} · {version.steps.length} 个步骤 · {version.author}</p>
+                    <Tag minimal intent={version.schedule?.valid ? 'success' : 'none'} icon="time">{version.schedule?.valid ? `排程 ${version.scheduleDate} · ${version.schedule.entries.length} 步已排入` : '未排程（旧版本）'}</Tag>
+                    <small>{version.note}</small></div>
                 </article>
               ))}
             </div>
@@ -696,13 +1135,36 @@ function App() {
               {versionDiff.map((diff) => <div className={`diff-row ${diff.kind}`} key={diff.id}><Tag minimal intent={diff.kind === 'added' ? 'success' : diff.kind === 'removed' ? 'danger' : 'primary'}>{diff.kind === 'added' ? '新增' : diff.kind === 'removed' ? '删除' : '修改'}</Tag><strong>{diff.title}</strong><p>{diff.detail}</p></div>)}
               {!versionDiff.length && <div className="empty-diff"><Icon icon="comparison" size={30} /><strong>两个版本没有差异</strong><p>请选择不同版本，或先冻结新的流程版本。</p></div>}
             </div>
+
+            <div className="schedule-diff-title"><span>SCHEDULE DIFF</span><h4>排程比较 · 仪器 / 开始 / 结束 / 等待</h4></div>
+            <div className="schedule-diff-table">
+              <div className="schedule-diff-head"><span>步骤</span><span>基准仪器</span><span>开始</span><span>结束</span><span>等待</span><span></span><span>目标仪器</span><span>开始</span><span>结束</span><span>等待</span></div>
+              {scheduleDiff.map((row) => (
+                <div className={`schedule-diff-row ${row.changed ? 'changed' : ''}`} key={row.id}>
+                  <span title={row.title}>{row.title}</span>
+                  <span>{row.base ? row.base.instrumentName : <em>未排程</em>}</span>
+                  <span className="mono">{row.base ? formatClock(row.base.start) : '—'}</span>
+                  <span className="mono">{row.base ? formatClock(row.base.end) : '—'}</span>
+                  <span className="mono">{row.base ? `${row.base.wait}′` : '—'}</span>
+                  <Icon icon={row.changed ? 'arrow-right' : 'minus'} size={12} />
+                  <span>{row.target ? row.target.instrumentName : <em>未排程</em>}</span>
+                  <span className="mono">{row.target ? formatClock(row.target.start) : '—'}</span>
+                  <span className="mono">{row.target ? formatClock(row.target.end) : '—'}</span>
+                  <span className="mono">{row.target ? `${row.target.wait}′` : '—'}</span>
+                </div>
+              ))}
+            </div>
           </Card>
           <Card elevation={Elevation.ONE} className="freeze-rules">
             <div className="card-title"><div><span>FREEZE RULES</span><h3>冻结检查</h3></div></div>
             <div className={confirmedCount === process.steps.length ? 'passed' : ''}><Icon icon={confirmedCount === process.steps.length ? 'tick-circle' : 'circle'} /><span><strong>所有步骤已确认</strong><small>{confirmedCount}/{process.steps.length}</small></span></div>
             <div className={!missingSafetySteps.length ? 'passed' : ''}><Icon icon={!missingSafetySteps.length ? 'tick-circle' : 'circle'} /><span><strong>安全信息完整</strong><small>{missingSafetySteps.length} 个缺口</small></span></div>
             <div className={process.steps.every((step) => step.dependencies.every((id) => process.steps.some((item) => item.id === id))) ? 'passed' : ''}><Icon icon="git-merge" /><span><strong>依赖引用有效</strong><small>{process.steps.reduce((sum, step) => sum + step.dependencies.length, 0)} 条依赖</small></span></div>
-            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || missingSafetySteps.length > 0} />
+            <div className={!scheduleInvalid && trialSchedule.unscheduledStepIds.length === 0 ? 'passed' : ''}>
+              <Icon icon={!scheduleInvalid && trialSchedule.unscheduledStepIds.length === 0 ? 'tick-circle' : 'circle'} />
+              <span><strong>当天排程全部生效</strong><small>{scheduleInvalid ? '排程冲突，已拒绝冻结' : trialSchedule.unscheduledStepIds.length ? `${trialSchedule.unscheduledStepIds.length} 个步骤未排程` : '窗口容量满足，开始/结束/等待已计算'}</small></span>
+            </div>
+            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || missingSafetySteps.length > 0 || scheduleInvalid || trialSchedule.unscheduledStepIds.length > 0} />
           </Card>
         </main>
       )}
@@ -760,6 +1222,8 @@ function compareVersions(process: ExperimentProcess, baseId: string, targetId: s
     if (before.purpose !== step.purpose) fields.push('目的');
     if (before.materials !== step.materials || before.amount !== step.amount) fields.push('材料或用量');
     if (before.equipment !== step.equipment) fields.push('设备');
+    if (before.instrumentId !== step.instrumentId) fields.push('排程仪器');
+    if (before.earliestStart !== step.earliestStart) fields.push('不可早于时间');
     if (before.duration !== step.duration) fields.push('预计时间');
     if (JSON.stringify(before.hazards) !== JSON.stringify(step.hazards)) fields.push('危险项');
     if (before.controls !== step.controls || before.safetyNote !== step.safetyNote) fields.push('安全控制');
